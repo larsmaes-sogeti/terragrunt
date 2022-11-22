@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/gruntwork-io/terragrunt/config"
 	"github.com/gruntwork-io/terragrunt/errors"
 	"github.com/gruntwork-io/terragrunt/options"
@@ -33,7 +35,10 @@ func (module *TerraformModule) String() string {
 	for _, dependency := range module.Dependencies {
 		dependencies = append(dependencies, dependency.Path)
 	}
-	return fmt.Sprintf("Module %s (excluded: %v, dependencies: [%s])", module.Path, module.FlagExcluded, strings.Join(dependencies, ", "))
+	return fmt.Sprintf(
+		"Module %s (excluded: %v, assume applied: %v, dependencies: [%s])",
+		module.Path, module.FlagExcluded, module.AssumeAlreadyApplied, strings.Join(dependencies, ", "),
+	)
 }
 
 // Go through each of the given Terragrunt configuration files and resolve the module that configuration file represents
@@ -64,7 +69,12 @@ func ResolveTerraformModules(terragruntConfigPaths []string, terragruntOptions *
 		return []*TerraformModule{}, err
 	}
 
-	finalModules, err := flagExcludedDirs(includedModules, terragruntOptions)
+	includedModulesWithExcluded, err := flagExcludedDirs(includedModules, terragruntOptions)
+	if err != nil {
+		return []*TerraformModule{}, err
+	}
+
+	finalModules, err := flagModulesThatDontInclude(includedModulesWithExcluded, terragruntOptions)
 	if err != nil {
 		return []*TerraformModule{}, err
 	}
@@ -212,6 +222,71 @@ func findModuleinPath(module *TerraformModule, targetDirs []string) bool {
 		}
 	}
 	return false
+}
+
+// flagModulesThatDontInclude iterates over a module slice and flags all modules that don't include at least one file in
+// the specified include list on the TerragruntOptions ModulesThatInclude attribute. Flagged modules will be filtered
+// out of the set.
+func flagModulesThatDontInclude(modules []*TerraformModule, terragruntOptions *options.TerragruntOptions) ([]*TerraformModule, error) {
+
+	// If no ModulesThatInclude is specified return the modules list instantly
+	if len(terragruntOptions.ModulesThatInclude) == 0 {
+		return modules, nil
+	}
+
+	modulesThatIncludeCanonicalPath := []string{}
+	for _, includePath := range terragruntOptions.ModulesThatInclude {
+		canonicalPath, err := util.CanonicalPath(includePath, terragruntOptions.WorkingDir)
+		if err != nil {
+			return nil, err
+		}
+
+		modulesThatIncludeCanonicalPath = append(modulesThatIncludeCanonicalPath, canonicalPath)
+	}
+
+	for _, module := range modules {
+		// Ignore modules that are already excluded because this feature is a filter for excluding the subset, not
+		// including modules that have already been excluded through other means.
+		if module.FlagExcluded {
+			continue
+		}
+
+		// Mark modules that don't include any of the specified paths as excluded. To do this, we first flag the module
+		// as excluded, and if it includes any path in the set, we set the exclude flag back to false.
+		module.FlagExcluded = true
+		for _, includeConfig := range module.Config.ProcessedIncludes {
+			// resolve include config to canonical path to compare with modulesThatIncludeCanonicalPath
+			// https://github.com/gruntwork-io/terragrunt/issues/1944
+			canonicalPath, err := util.CanonicalPath(includeConfig.Path, module.Path)
+			if err != nil {
+				return nil, err
+			}
+			if util.ListContainsElement(modulesThatIncludeCanonicalPath, canonicalPath) {
+				module.FlagExcluded = false
+			}
+		}
+
+		// Also search module dependencies and exclude if the dependency path doesn't include any of the specified
+		// paths, using a similar logic.
+		for _, dependency := range module.Dependencies {
+			if dependency.FlagExcluded {
+				continue
+			}
+
+			dependency.FlagExcluded = true
+			for _, includeConfig := range dependency.Config.ProcessedIncludes {
+				canonicalPath, err := util.CanonicalPath(includeConfig.Path, module.Path)
+				if err != nil {
+					return nil, err
+				}
+				if util.ListContainsElement(modulesThatIncludeCanonicalPath, canonicalPath) {
+					dependency.FlagExcluded = false
+				}
+			}
+		}
+	}
+
+	return modules, nil
 }
 
 // Go through each of the given Terragrunt configuration files and resolve the module that configuration file represents
@@ -386,6 +461,9 @@ func resolveExternalDependenciesForModule(module *TerraformModule, moduleMap map
 
 // Confirm with the user whether they want Terragrunt to assume the given dependency of the given module is already
 // applied. If the user selects "yes", then Terragrunt will apply that module as well.
+// Note that we skip the prompt for `run-all destroy` calls. Given the destructive and irreversible nature of destroy, we don't
+// want to provide any risk to the user of accidentally destroying an external dependency unless explicitly included
+// with the --terragrunt-include-external-dependencies or --terragrunt-include-dir flags.
 func confirmShouldApplyExternalDependency(module *TerraformModule, dependency *TerraformModule, terragruntOptions *options.TerragruntOptions) (bool, error) {
 	if terragruntOptions.IncludeExternalDependencies {
 		terragruntOptions.Logger.Debugf("The --terragrunt-include-external-dependencies flag is set, so automatically including all external dependencies, and will run this command against module %s, which is a dependency of module %s.", dependency.Path, module.Path)
@@ -393,7 +471,13 @@ func confirmShouldApplyExternalDependency(module *TerraformModule, dependency *T
 	}
 
 	if terragruntOptions.NonInteractive {
-		terragruntOptions.Logger.Debugf("The --non-interactive flag is set. To avoid accidentally affecting external dependencies with an xxx-all command, will not run this command against module %s, which is a dependency of module %s.", dependency.Path, module.Path)
+		terragruntOptions.Logger.Debugf("The --non-interactive flag is set. To avoid accidentally affecting external dependencies with a run-all command, will not run this command against module %s, which is a dependency of module %s.", dependency.Path, module.Path)
+		return false, nil
+	}
+
+	stackCmd := terragruntOptions.TerraformCommand
+	if stackCmd == "destroy" {
+		terragruntOptions.Logger.Debugf("run-all command called with destroy. To avoid accidentally having destructive effects on external dependencies with run-all command, will not run this command against module %s, which is a dependency of module %s.", dependency.Path, module.Path)
 		return false, nil
 	}
 
@@ -470,13 +554,73 @@ func getDependenciesForModule(module *TerraformModule, moduleMap map[string]*Ter
 // in a consistent order (Go does not guarantee iteration order for maps, and usually makes it random)
 func getSortedKeys(modules map[string]*TerraformModule) []string {
 	keys := []string{}
-	for key, _ := range modules {
+	for key := range modules {
 		keys = append(keys, key)
 	}
 
 	sort.Strings(keys)
 
 	return keys
+}
+
+// FindWhereWorkingDirIsIncluded - find where working directory is included, flow:
+// 1. Find root git top level directory and build list of modules
+// 2. Iterate over includes from terragruntOptions if git top level directory detection failed
+// 3. Filter found module only items which has in dependencies working directory
+func FindWhereWorkingDirIsIncluded(terragruntOptions *options.TerragruntOptions, terragruntConfig *config.TerragruntConfig) []*TerraformModule {
+	var pathsToCheck []string
+	var matchedModulesMap = make(map[string]*TerraformModule)
+	var gitTopLevelDir = ""
+	gitTopLevelDir, err := shell.GitTopLevelDir(terragruntOptions, terragruntOptions.WorkingDir)
+	if err == nil { // top level detection worked
+		pathsToCheck = append(pathsToCheck, gitTopLevelDir)
+	} else { // detection failed, trying to use include directories as source for stacks
+		uniquePaths := make(map[string]bool)
+		for _, includePath := range terragruntConfig.ProcessedIncludes {
+			uniquePaths[filepath.Dir(includePath.Path)] = true
+		}
+		for path := range uniquePaths {
+			pathsToCheck = append(pathsToCheck, path)
+		}
+	}
+	for _, dir := range pathsToCheck { // iterate over detected paths, build stacks and filter modules by working dir
+		dir = dir + filepath.FromSlash("/")
+		cfgOptions, err := options.NewTerragruntOptions(dir)
+		if err != nil {
+			terragruntOptions.Logger.Debugf("Failed to build terragrunt options from %s %v", dir, err)
+			return nil
+		}
+		cfgOptions.Env = terragruntOptions.Env
+		cfgOptions.LogLevel = terragruntOptions.LogLevel
+		if terragruntOptions.TerraformCommand == "destroy" {
+			var hook = NewForceLogLevelHook(logrus.DebugLevel)
+			cfgOptions.Logger.Logger.AddHook(hook)
+		}
+		stack, err := FindStackInSubfolders(cfgOptions)
+		if err != nil {
+			// loggign error as debug since in some cases stack building may fail because parent files can be designed
+			// to work with relative paths from downstream modules
+			terragruntOptions.Logger.Debugf("Failed to build module stack %v", err)
+			return nil
+		}
+
+		for _, module := range stack.Modules {
+			for _, dep := range module.Dependencies {
+				if dep.Path == terragruntOptions.WorkingDir { // include in dependencies module which have in dependencies WorkingDir
+					matchedModulesMap[module.Path] = module
+					break
+				}
+			}
+		}
+	}
+
+	// extract modules as list
+	var matchedModules []*TerraformModule
+	for _, module := range matchedModulesMap {
+		matchedModules = append(matchedModules, module)
+	}
+
+	return matchedModules
 }
 
 // Custom error types
@@ -508,4 +652,45 @@ type InfiniteRecursion struct {
 
 func (err InfiniteRecursion) Error() string {
 	return fmt.Sprintf("Hit what seems to be an infinite recursion after going %d levels deep. Please check for a circular dependency! Modules involved: %v", err.RecursionLevel, err.Modules)
+}
+
+// ForceLogLevelHook - log hook which can change log level for messages which contains specific substrings
+type ForceLogLevelHook struct {
+	TriggerLevels []logrus.Level
+	ForcedLevel   logrus.Level
+}
+
+// NewForceLogLevelHook - create default log reduction hook
+func NewForceLogLevelHook(forcedLevel logrus.Level) *ForceLogLevelHook {
+	return &ForceLogLevelHook{
+		ForcedLevel:   forcedLevel,
+		TriggerLevels: logrus.AllLevels,
+	}
+}
+
+// Levels - return log levels on which hook will be triggered
+func (hook *ForceLogLevelHook) Levels() []logrus.Level {
+	return hook.TriggerLevels
+}
+
+// Fire - function invoked against log entries when entry will match loglevel from Levels()
+func (hook *ForceLogLevelHook) Fire(entry *logrus.Entry) error {
+	entry.Level = hook.ForcedLevel
+	// special formatter to skip printing of log entries since after hook evaluation, entries are printed directly
+	formatter := LogEntriesDropperFormatter{OriginalFormatter: entry.Logger.Formatter}
+	entry.Logger.Formatter = &formatter
+	return nil
+}
+
+// LogEntriesDropperFormatter - custom formatter which will ignore log entries which has lower level than preconfigured in logger
+type LogEntriesDropperFormatter struct {
+	OriginalFormatter logrus.Formatter
+}
+
+// Format - custom entry formatting function which will drop entries with lower level than set in logger
+func (formatter *LogEntriesDropperFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	if entry.Logger.Level >= entry.Level {
+		return formatter.OriginalFormatter.Format(entry)
+	}
+	return []byte(""), nil
 }

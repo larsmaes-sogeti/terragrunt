@@ -14,6 +14,16 @@ import (
 	"github.com/gruntwork-io/terragrunt/util"
 )
 
+const validateInputsHelp = `
+   Usage: terragrunt validate-inputs [OPTIONS]
+
+   Description:
+   Checks if the terragrunt configured inputs align with the terraform defined variables.
+   
+   Options:
+   --terragrunt-strict-validate		Enable strict mode for validation. When strict mode is turned on, an error will be returned if required inputs are missing OR if unused variables are passed to Terragrunt.
+`
+
 // validateTerragruntInputs will collect all the terraform variables defined in the target module, and the terragrunt
 // inputs that are configured, and compare the two to determine if there are any unused inputs or undefined required
 // inputs.
@@ -54,6 +64,7 @@ func validateTerragruntInputs(terragruntOptions *options.TerragruntOptions, work
 		terragruntOptions.Logger.Warn("")
 	} else {
 		terragruntOptions.Logger.Info("All variables passed in by terragrunt are in use.")
+		terragruntOptions.Logger.Debug(fmt.Sprintf("Strict mode enabled: %t", terragruntOptions.ValidateStrict))
 	}
 
 	if len(missingVars) > 0 {
@@ -63,13 +74,19 @@ func validateTerragruntInputs(terragruntOptions *options.TerragruntOptions, work
 		}
 		terragruntOptions.Logger.Error("")
 	} else {
-		terragruntOptions.Logger.Info("All required inputs are passed in by terragrunt.")
+		terragruntOptions.Logger.Info("All required inputs are passed in by terragrunt")
+		terragruntOptions.Logger.Debug(fmt.Sprintf("Strict mode enabled: %t", terragruntOptions.ValidateStrict))
 	}
 
-	// Return an error when there are misaligned inputs.
-	if len(unusedVars) > 0 || len(missingVars) > 0 {
-		return fmt.Errorf("Terragrunt configuration has misaligned inputs")
+	// Return an error when there are misaligned inputs. Terragrunt strict mode defaults to false. When it is false,
+	// an error will only be returned if required inputs are missing. When strict mode is true, an error will be
+	// returned if required inputs are missing OR if any unused variables are passed
+	if len(missingVars) > 0 || len(unusedVars) > 0 && terragruntOptions.ValidateStrict {
+		return fmt.Errorf(fmt.Sprintf("Terragrunt configuration has misaligned inputs. Strict mode enabled: %t.", terragruntOptions.ValidateStrict))
+	} else if len(unusedVars) > 0 {
+		terragruntOptions.Logger.Warn("Terragrunt configuration has misaligned inputs, but running in relaxed mode so ignoring.")
 	}
+
 	return nil
 }
 
@@ -116,7 +133,7 @@ func getDefinedTerragruntInputs(terragruntOptions *options.TerragruntOptions, wo
 	}
 
 	out := []string{}
-	for varName, _ := range tmpOut {
+	for varName := range tmpOut {
 		out = append(out, varName)
 	}
 	return out, nil
@@ -141,7 +158,7 @@ func getTerraformInputNamesFromEnvVar(terragruntOptions *options.TerragruntOptio
 	}
 
 	out := []string{}
-	for envName, _ := range envVars {
+	for envName := range envVars {
 		if strings.HasPrefix(envName, TFVarPrefix) {
 			out = append(out, strings.TrimPrefix(envName, fmt.Sprintf("%s_", TFVarPrefix)))
 		}
@@ -153,7 +170,7 @@ func getTerraformInputNamesFromEnvVar(terragruntOptions *options.TerragruntOptio
 // terragrunt config.
 func getTerraformInputNamesFromConfig(terragruntConfig *config.TerragruntConfig) []string {
 	out := []string{}
-	for inputName, _ := range terragruntConfig.Inputs {
+	for inputName := range terragruntConfig.Inputs {
 		out = append(out, inputName)
 	}
 	return out
@@ -267,7 +284,7 @@ func getVarNamesFromVarFile(varFile string) ([]string, error) {
 	}
 
 	out := []string{}
-	for varName, _ := range variables {
+	for varName := range variables {
 		out = append(out, varName)
 	}
 	return out, nil

@@ -24,10 +24,16 @@ Terragrunt allows you to use built-in functions anywhere in `terragrunt.hcl`, ju
 
   - [get\_platform()](#get_platform)
 
+  - [get\_repo\_root()](#get_repo_root)
+
+  - [get\_path\_from\_repo\_root()](#get_path_from_repo_root)
+
+  - [get\_path\_to\_repo\_root()](#get_path_to_repo_root)
+
   - [get\_terragrunt\_dir()](#get_terragrunt_dir)
 
   - [get\_parent\_terragrunt\_dir()](#get_parent_terragrunt_dir)
-  
+
   - [get\_original\_terragrunt\_dir()](#get_original_terragrunt_dir)
 
   - [get\_terraform\_commands\_that\_need\_vars()](#get_terraform_commands_that_need_vars)
@@ -97,7 +103,7 @@ file("assets/mysql/assets.txt")
 `find_in_parent_folders()` searches up the directory tree from the current `terragrunt.hcl` file and returns the absolute path to the first `terragrunt.hcl` in a parent folder or exit with an error if no such file is found. This is primarily useful in an `include` block to automatically find the path to a parent `terragrunt.hcl` file:
 
 ``` hcl
-include {
+include "root" {
   path = find_in_parent_folders()
 }
 ```
@@ -105,7 +111,7 @@ include {
 The function takes an optional `name` parameter that allows you to specify a different filename to search for:
 
 ``` hcl
-include {
+include "root" {
   path = find_in_parent_folders("some-other-file-name.hcl")
 }
 ```
@@ -113,7 +119,7 @@ include {
 You can also pass an optional second `fallback` parameter which causes the function to return the fallback value (instead of exiting with an error) if the file in the `name` parameter cannot be found:
 
 ``` hcl
-include {
+include "root" {
   path = find_in_parent_folders("some-other-file-name.hcl", "fallback.hcl")
 }
 ```
@@ -152,7 +158,7 @@ finding the `env.hcl` file in the `prod` directory.
 Imagine `prod/mysql/terragrunt.hcl` and `stage/mysql/terragrunt.hcl` include all settings from the root `terragrunt.hcl` file:
 
 ``` hcl
-include {
+include "root" {
   path = find_in_parent_folders()
 }
 ```
@@ -171,6 +177,24 @@ remote_state {
 ```
 
 The resulting `key` will be `prod/mysql/terraform.tfstate` for the prod `mysql` module and `stage/mysql/terraform.tfstate` for the stage `mysql` module.
+
+If you have `include` blocks, this function requires a `name` parameter when used in the child config to specify which
+`include` block to base the relative path on.
+
+Example:
+
+```hcl
+include "root" {
+  path = find_in_parent_folders()
+}
+include "region" {
+  path = find_in_parent_folders("region.hcl")
+}
+
+terraform {
+  source = "../modules/${path_relative_to_include("root")}"
+}
+```
 
 ## path\_relative\_from\_include
 
@@ -194,7 +218,7 @@ The resulting `key` will be `prod/mysql/terraform.tfstate` for the prod `mysql` 
 Imagine `terragrunt/mysql/terragrunt.hcl` and `terragrunt/secrets/mysql/terragrunt.hcl` include all settings from the root `terragrunt.hcl` file:
 
 ``` hcl
-include {
+include "root" {
   path = find_in_parent_folders()
 }
 ```
@@ -230,6 +254,25 @@ Another use case would be to add extra argument to include the `common.tfvars` f
 ```
 
 This allows proper retrieval of the `common.tfvars` from whatever the level of subdirectories we have.
+
+If you have `include` blocks, this function requires a `name` parameter when used in the child config to specify which
+`include` block to base the relative path on.
+
+Example:
+
+```hcl
+include "root" {
+  path = find_in_parent_folders()
+}
+include "region" {
+  path = find_in_parent_folders("region.hcl")
+}
+
+terraform {
+  source = "../modules/${path_relative_from_include("root")}"
+}
+```
+
 
 ## get\_env
 
@@ -281,6 +324,53 @@ freebsd
 linux
 windows
 ```
+
+## get\_repo\_root
+
+`get_repo_root()` returns the absolute path to the root of the Git repository:
+
+```hcl
+inputs {
+  very_important_config = "${get_repo_root()}/config/strawberries.conf"
+}
+```
+
+This function will error if the file is not located in a Git repository.
+
+
+## get\_path\_from\_repo\_root
+
+`get_path_from_repo_root()` returns the path from the root of the Git repository to the current directory:
+
+```hcl
+remote_state {
+  backend = "s3"
+
+  config = {
+    bucket         = "terraform"
+    dynamodb_table = "terraform"
+    encrypt        = true
+    key            = "${get_path_from_repo_root()}/terraform.tfstate"
+    session_name   = "terraform"
+    region         = "us-east-1"
+  }
+}
+```
+
+This function will error if the file is not located in a Git repository.
+
+
+## get\_path\_to\_repo\_root
+
+`get_path_to_repo_root()` returns the relative path to the root of the Git repository:
+
+```hcl
+terraform {
+  source = "${get_path_to_repo_root()}//modules/example"
+}
+```
+
+This function will error if the file is not located in a Git repository.
 
 ## get\_terragrunt\_dir
 
@@ -379,11 +469,31 @@ terraform {
 
 The common.tfvars located in the terraform root folder will be included by all applications, whatever their relative location to the root.
 
+If you have `include` blocks, this function requires a `name` parameter when used in the child config to specify which
+`include` block to base the parent dir on.
+
+Example:
+
+```hcl
+include "root" {
+  path = find_in_parent_folders()
+}
+include "region" {
+  path = find_in_parent_folders("region.hcl")
+}
+
+terraform {
+  source = "${get_parent_terragrunt_dir("root")}/modules/vpc"
+}
+```
+
+
+
 ## get\_original\_terragrunt\_dir
 
-`get_original_terragrunt_dir()` returns the directory where the original Terragrunt configuration file (by default 
-`terragrunt.hcl`) lives. This is primarily useful when one Terragrunt config is being read from another: e.g., if 
-`/terraform-code/terragrunt.hcl` calls `read_terragrunt_config("/foo/bar.hcl")`, and within `bar.hcl`, you call 
+`get_original_terragrunt_dir()` returns the directory where the original Terragrunt configuration file (by default
+`terragrunt.hcl`) lives. This is primarily useful when one Terragrunt config is being read from another: e.g., if
+`/terraform-code/terragrunt.hcl` calls `read_terragrunt_config("/foo/bar.hcl")`, and within `bar.hcl`, you call
 `get_original_terragrunt_dir()`, you'll get back `/terraform-code`.
 
 ## get\_terraform\_commands\_that\_need\_vars
@@ -453,6 +563,7 @@ remote_state {
   }
 }
 ```
+**Note:** value returned by `get_aws_account_id()` can change during parsing of HCL code, for example after evaluation of `iam_role` attribute.
 
 ## get\_aws\_caller\_identity\_arn
 
@@ -463,6 +574,7 @@ inputs = {
   caller_arn = get_aws_caller_identity_arn()
 }
 ```
+**Note:** value returned by `get_aws_caller_identity_arn()` can change during parsing of HCL code, for example after evaluation of `iam_role` attribute.
 
 ## get\_terraform\_command
 
@@ -506,6 +618,7 @@ terraform {
   }
 }
 ```
+**Note:** value returned by `get_aws_caller_identity_user_id()` can change during parsing of HCL code, for example after evaluation of `iam_role` attribute.
 
 ## run\_cmd
 
@@ -531,6 +644,46 @@ super_secret_value = run_cmd("--terragrunt-quiet", "./decrypt_secret.sh", "foo")
 
 **Note:** This will prevent terragrunt from displaying the output from the command in its output. However, the value could still be displayed in the Terraform output if Terraform does not treat it as a [sensitive value](https://www.terraform.io/docs/configuration/outputs.html#sensitive-suppressing-values-in-cli-output).
 
+Invocations of `run_cmd` are cached based on directory and executed command, so cached values are re-used later, rather than executed multiple times. Here's an example:
+```hcl
+locals {
+  uuid = run_cmd("echo", "uuid1",  uuid())
+  uuid2 = run_cmd("echo", "uuid2", uuid())
+  uuid3 = run_cmd("echo", "uuid3", uuid())
+  potato = run_cmd("echo", "potato")
+  potato2 = run_cmd("echo", "potato")
+  carrot = run_cmd("echo", "carrot")
+}
+inputs = {
+  potato3 = run_cmd("echo", "potato")
+  uuid3 = run_cmd("echo", "uuid3", uuid())
+  uuid4 = run_cmd("echo", "uuid4", uuid())
+  carrot2 = run_cmd("echo", "carrot")
+}
+```
+
+Output:
+```
+$ terragrunt init
+uuid1 b48379e1-924d-2403-8789-c72d50be964c
+uuid1 9f3a8398-b11f-5314-7783-dad176ee487d
+uuid1 649ac501-e5db-c935-1499-c59fb7a75625
+uuid2 2d65972b-3fa9-181f-64fe-dcd574d944d0
+uuid3 e345de60-9cfa-0455-79b7-af0d053a15a5
+potato
+uuid3 7f90a4ed-96e3-1dd8-5fee-91b8c8e07650
+uuid2 8638fe79-c589-bebd-2a2a-3e6b96f7fc34
+uuid3 310d0447-f0a6-3f67-efda-e6b1521fa1fb
+uuid4 f8e80cc6-1892-8db7-bd63-6089fef00c01
+uuid2 289ff371-8021-54c6-2254-72de9d11392a
+uuid3 baa19863-1d99-e0ef-11f2-ede830d1c58a
+carrot
+```
+**Notes:**
+  * Output contains only once `carrot` and `potato`, because other invocations got cached, caching works for all sections
+  * Output contains multiple times `uuid1` and `uuid2` because during HCL evaluation each `run_cmd` in `locals` is evaluated multiple times and random argument generated from `uuid()` save cached value under different key each time
+  * Output contains multiple times `uuid3`, +1 more output comparing to `uuid1` and `uuid2` - because `uuid3` is declared in locals and inputs which add one more evaluation
+  * Output contains only once `uuid4` since it is declared only once in `inputs`, `inputs` is not evaluated twice
 
 ## read\_terragrunt\_config
 
@@ -600,14 +753,12 @@ inputs = {
 
 ## sops\_decrypt\_file
 
-`sops_decrypt_file(file_path)` decrypts a yaml or json file encrypted with `sops`.
+`sops_decrypt_file(file_path)` decrypts a yaml, json, ini, env or "raw text" file encrypted with `sops`.
 
 [sops](https://github.com/mozilla/sops) is an editor of encrypted files that supports YAML, JSON, ENV, INI and
 BINARY formats and encrypts with AWS KMS, GCP KMS, Azure Key Vault, Hashicorp Vault and PGP.
 
 This allows static secrets to be stored encrypted within your Terragrunt repository.
-
-Only YAML and JSON formats are supported by `sops_decrypt_file`
 
 For example, suppose you have some static secrets required to bootstrap your
 infrastructure in `secrets.yaml`, you can decrypt and merge them into the inputs

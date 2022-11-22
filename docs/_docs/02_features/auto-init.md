@@ -5,7 +5,7 @@ category: features
 categories_url: features
 excerpt: Auto-Init is a feature of Terragrunt that makes it so that terragrunt init does not need to be called explicitly before other terragrunt commands.
 tags: ["CLI"]
-order: 209
+order: 245
 nav_title: Documentation
 nav_title_link: /docs/
 ---
@@ -18,6 +18,8 @@ When Auto-Init is enabled (the default), terragrunt will automatically call [`te
   - `terraform init` has never been called, or
 
   - `source` needs to be downloaded, or
+
+  - exists file `.terragrunt-init-required` in downloaded module directory(`.terragrunt-cache/aaa/bbb/modules/<module>`) or
 
   - the modules or remote state used by the module have changed since the previous call to `terraform init`.
 

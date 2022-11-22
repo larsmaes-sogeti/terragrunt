@@ -124,6 +124,14 @@ func RunShellCommandWithOutput(
 		Stderr: stderrBuf.String(),
 	}
 
+	if err != nil {
+		err = ProcessExecutionError{
+			Err:    err,
+			StdOut: stdoutBuf.String(),
+			Stderr: stderrBuf.String(),
+		}
+	}
+
 	return &cmdOutput, errors.WithStackTrace(err)
 }
 
@@ -199,4 +207,38 @@ func (signalChannel *SignalsForwarder) Close() error {
 type CmdOutput struct {
 	Stdout string
 	Stderr string
+}
+
+// GitTopLevelDir - fetch git repository path from passed directory
+func GitTopLevelDir(terragruntOptions *options.TerragruntOptions, path string) (string, error) {
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+	opts, err := options.NewTerragruntOptions(path)
+	if err != nil {
+		return "", err
+	}
+	opts.Env = terragruntOptions.Env
+	opts.Writer = &stdout
+	opts.ErrWriter = &stderr
+	cmd, err := RunShellCommandWithOutput(opts, path, true, false, "git", "rev-parse", "--show-toplevel")
+	terragruntOptions.Logger.Debugf("git show-toplevel result: \n%v\n%v\n", (string)(stdout.Bytes()), (string)(stderr.Bytes()))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(cmd.Stdout), nil
+}
+
+// ProcessExecutionError - error returned when a command fails, contains StdOut and StdErr
+type ProcessExecutionError struct {
+	Err    error
+	StdOut string
+	Stderr string
+}
+
+func (err ProcessExecutionError) Error() string {
+	return err.Err.Error()
+}
+
+func (err ProcessExecutionError) ExitStatus() (int, error) {
+	return GetExitCode(err.Err)
 }

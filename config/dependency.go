@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty/cty"
@@ -29,6 +31,8 @@ import (
 	"github.com/gruntwork-io/terragrunt/util"
 )
 
+const renderJsonCommand = "render-json"
+
 type Dependency struct {
 	Name                                string     `hcl:",label" cty:"name"`
 	ConfigPath                          string     `hcl:"config_path,attr" cty:"config_path"`
@@ -36,8 +40,68 @@ type Dependency struct {
 	MockOutputs                         *cty.Value `hcl:"mock_outputs,attr" cty:"mock_outputs"`
 	MockOutputsAllowedTerraformCommands *[]string  `hcl:"mock_outputs_allowed_terraform_commands,attr" cty:"mock_outputs_allowed_terraform_commands"`
 
+	// MockOutputsMergeWithState is deprecated. Use MockOutputsMergeStrategyWithState
+	MockOutputsMergeWithState         *bool              `hcl:"mock_outputs_merge_with_state,attr" cty:"mock_outputs_merge_with_state"`
+	MockOutputsMergeStrategyWithState *MergeStrategyType `hcl:"mock_outputs_merge_strategy_with_state" cty:"mock_outputs_merge_strategy_with_state"`
+
 	// Used to store the rendered outputs for use when the config is imported or read with `read_terragrunt_config`
 	RenderedOutputs *cty.Value `cty:"outputs"`
+}
+
+// DeepMerge will deep merge two Dependency configs, updating the target. Deep merge for Dependency configs is defined
+// as follows:
+// - For simple attributes (bools and strings), the source will override the target.
+// - For MockOutputs, the two maps will be deeply merged together. This means that maps are recursively merged, while
+//   lists are concatenated together.
+// - For MockOutputsAllowedTerraformCommands, the source will be concatenated to the target.
+// Note that RenderedOutputs is ignored in the deep merge operation.
+func (targetDepConfig *Dependency) DeepMerge(sourceDepConfig Dependency) error {
+	if sourceDepConfig.ConfigPath != "" {
+		targetDepConfig.ConfigPath = sourceDepConfig.ConfigPath
+	}
+
+	if sourceDepConfig.SkipOutputs != nil {
+		targetDepConfig.SkipOutputs = sourceDepConfig.SkipOutputs
+	}
+
+	if sourceDepConfig.MockOutputs != nil {
+		if targetDepConfig.MockOutputs == nil {
+			targetDepConfig.MockOutputs = sourceDepConfig.MockOutputs
+		} else {
+			newMockOutputs, err := deepMergeCtyMaps(*targetDepConfig.MockOutputs, *sourceDepConfig.MockOutputs)
+			if err != nil {
+				return err
+			}
+			targetDepConfig.MockOutputs = newMockOutputs
+		}
+	}
+
+	if sourceDepConfig.MockOutputsAllowedTerraformCommands != nil {
+		if targetDepConfig.MockOutputsAllowedTerraformCommands == nil {
+			targetDepConfig.MockOutputsAllowedTerraformCommands = sourceDepConfig.MockOutputsAllowedTerraformCommands
+		} else {
+			mergedCmds := append(*targetDepConfig.MockOutputsAllowedTerraformCommands, *sourceDepConfig.MockOutputsAllowedTerraformCommands...)
+			targetDepConfig.MockOutputsAllowedTerraformCommands = &mergedCmds
+		}
+	}
+
+	return nil
+}
+
+// getMockOutputsMergeStrategy returns the MergeStrategyType following the deprecation of mock_outputs_merge_with_state
+// - If mock_outputs_merge_strategy_with_state is not null. The value of mock_outputs_merge_strategy_with_state will be returned
+// - If mock_outputs_merge_strategy_with_state is null and mock_outputs_merge_with_state is not null:
+//   - mock_outputs_merge_with_state being true returns ShallowMerge
+//   - mock_outputs_merge_with_state being false returns NoMerge
+func (dependencyConfig Dependency) getMockOutputsMergeStrategy() MergeStrategyType {
+	if dependencyConfig.MockOutputsMergeStrategyWithState == nil {
+		if dependencyConfig.MockOutputsMergeWithState != nil && (*dependencyConfig.MockOutputsMergeWithState) {
+			return ShallowMerge
+		} else {
+			return NoMerge
+		}
+	}
+	return *dependencyConfig.MockOutputsMergeStrategyWithState
 }
 
 // Given a dependency config, we should only attempt to get the outputs if SkipOutputs is nil or false
@@ -45,8 +109,21 @@ func (dependencyConfig Dependency) shouldGetOutputs() bool {
 	return dependencyConfig.SkipOutputs == nil || !(*dependencyConfig.SkipOutputs)
 }
 
+// Given a dependency config, we should only attempt to merge mocks outputs with the outputs if MockOutputsMergeWithState is not nil or true
+func (dependencyConfig Dependency) shouldMergeMockOutputsWithState(terragruntOptions *options.TerragruntOptions) bool {
+	allowedCommand :=
+		dependencyConfig.MockOutputsAllowedTerraformCommands == nil ||
+			len(*dependencyConfig.MockOutputsAllowedTerraformCommands) == 0 ||
+			util.ListContainsElement(*dependencyConfig.MockOutputsAllowedTerraformCommands, terragruntOptions.OriginalTerraformCommand)
+	return allowedCommand && dependencyConfig.getMockOutputsMergeStrategy() != NoMerge
+}
+
 func (dependencyConfig *Dependency) setRenderedOutputs(terragruntOptions *options.TerragruntOptions) error {
-	if (*dependencyConfig).shouldGetOutputs() || shouldReturnMockOutputs(*dependencyConfig, terragruntOptions) {
+	if dependencyConfig == nil {
+		return nil
+	}
+
+	if (*dependencyConfig).shouldGetOutputs() || (*dependencyConfig).shouldReturnMockOutputs(terragruntOptions) {
 		outputVal, err := getTerragruntOutputIfAppliedElseConfiguredDefault(*dependencyConfig, terragruntOptions)
 		if err != nil {
 			return err
@@ -73,12 +150,23 @@ func decodeAndRetrieveOutputs(
 	file *hcl.File,
 	filename string,
 	terragruntOptions *options.TerragruntOptions,
+	trackInclude *TrackInclude,
 	extensions EvalContextExtensions,
 ) (*cty.Value, error) {
 	decodedDependency := terragruntDependency{}
 	if err := decodeHcl(file, filename, &decodedDependency, terragruntOptions, extensions); err != nil {
 		return nil, err
 	}
+
+	// Merge in included dependencies
+	if trackInclude != nil {
+		mergedDecodedDependency, err := handleIncludeForDependency(decodedDependency, trackInclude, terragruntOptions)
+		if err != nil {
+			return nil, err
+		}
+		decodedDependency = *mergedDecodedDependency
+	}
+
 	if err := checkForDependencyBlockCycles(filename, decodedDependency, terragruntOptions); err != nil {
 		return nil, err
 	}
@@ -235,6 +323,7 @@ func dependencyBlocksToCtyValue(dependencyConfigs []Dependency, terragruntOption
 // This will attempt to get the outputs from the target terragrunt config if it is applied. If it is not applied, the
 // behavior is different depending on the configuration of the dependency:
 // - If the dependency block indicates a mock_outputs attribute, this will return that.
+//   If the dependency block indicates a mock_outputs_merge_strategy_with_state attribute, mock_outputs and state outputs will be merged following the merge strategy
 // - If the dependency block does NOT indicate a mock_outputs attribute, this will return an error.
 func getTerragruntOutputIfAppliedElseConfiguredDefault(dependencyConfig Dependency, terragruntOptions *options.TerragruntOptions) (*cty.Value, error) {
 	if dependencyConfig.shouldGetOutputs() {
@@ -243,7 +332,20 @@ func getTerragruntOutputIfAppliedElseConfiguredDefault(dependencyConfig Dependen
 			return nil, err
 		}
 
-		if !isEmpty {
+		if !isEmpty && dependencyConfig.shouldMergeMockOutputsWithState(terragruntOptions) {
+			mockMergeStrategy := dependencyConfig.getMockOutputsMergeStrategy()
+			switch mockMergeStrategy {
+			case NoMerge:
+				return outputVal, nil
+			case ShallowMerge:
+				return shallowMergeCtyMaps(*outputVal, *dependencyConfig.MockOutputs)
+			case DeepMergeMapOnly:
+				return deepMergeCtyMapsMapOnly(*dependencyConfig.MockOutputs, *outputVal)
+			default:
+				return nil, errors.WithStackTrace(InvalidMergeStrategyType(mockMergeStrategy))
+			}
+
+		} else if !isEmpty {
 			return outputVal, err
 		}
 	}
@@ -253,7 +355,7 @@ func getTerragruntOutputIfAppliedElseConfiguredDefault(dependencyConfig Dependen
 	// return error.
 	targetConfig := getCleanedTargetConfigPath(dependencyConfig.ConfigPath, terragruntOptions.TerragruntConfigPath)
 	currentConfig := terragruntOptions.TerragruntConfigPath
-	if shouldReturnMockOutputs(dependencyConfig, terragruntOptions) {
+	if dependencyConfig.shouldReturnMockOutputs(terragruntOptions) {
 		terragruntOptions.Logger.Debugf("WARNING: config %s is a dependency of %s that has no outputs, but mock outputs provided and returning those in dependency output.",
 			targetConfig,
 			currentConfig,
@@ -261,6 +363,9 @@ func getTerragruntOutputIfAppliedElseConfiguredDefault(dependencyConfig Dependen
 		return dependencyConfig.MockOutputs, nil
 	}
 
+	// At this point, we expect outputs to exist because there is a `dependency` block without skip_outputs = true, and
+	// returning mocks is not allowed. So return a useful error message indicating that we expected outputs, but they
+	// did not exist.
 	err := TerragruntOutputTargetNoOutputs{
 		targetConfig:  targetConfig,
 		currentConfig: currentConfig,
@@ -270,13 +375,13 @@ func getTerragruntOutputIfAppliedElseConfiguredDefault(dependencyConfig Dependen
 
 // We should only return default outputs if the mock_outputs attribute is set, and if we are running one of the
 // allowed commands when `mock_outputs_allowed_terraform_commands` is set as well.
-func shouldReturnMockOutputs(dependencyConfig Dependency, terragruntOptions *options.TerragruntOptions) bool {
+func (dependencyConfig Dependency) shouldReturnMockOutputs(terragruntOptions *options.TerragruntOptions) bool {
 	defaultOutputsSet := dependencyConfig.MockOutputs != nil
 	allowedCommand :=
 		dependencyConfig.MockOutputsAllowedTerraformCommands == nil ||
 			len(*dependencyConfig.MockOutputsAllowedTerraformCommands) == 0 ||
 			util.ListContainsElement(*dependencyConfig.MockOutputsAllowedTerraformCommands, terragruntOptions.OriginalTerraformCommand)
-	return defaultOutputsSet && allowedCommand
+	return defaultOutputsSet && allowedCommand || isRenderJsonCommand(terragruntOptions)
 }
 
 // Return the output from the state of another module, managed by terragrunt. This function will parse the provided
@@ -292,7 +397,14 @@ func getTerragruntOutput(dependencyConfig Dependency, terragruntOptions *options
 
 	jsonBytes, err := getOutputJsonWithCaching(targetConfig, terragruntOptions)
 	if err != nil {
-		return nil, true, err
+		if !isRenderJsonCommand(terragruntOptions) {
+			return nil, true, err
+		}
+		terragruntOptions.Logger.Warnf("Failed to read outputs from %s referenced in %s as %s, fallback to mock outputs. Error: %v", targetConfig, terragruntOptions.TerragruntConfigPath, dependencyConfig.Name, err)
+		jsonBytes, err = json.Marshal(dependencyConfig.MockOutputs)
+		if err != nil {
+			return nil, true, err
+		}
 	}
 	isEmpty := string(jsonBytes) == "{}"
 
@@ -307,6 +419,11 @@ func getTerragruntOutput(dependencyConfig Dependency, terragruntOptions *options
 		err = TerragruntOutputEncodingError{Path: targetConfig, Err: err}
 	}
 	return &convertedOutput, isEmpty, errors.WithStackTrace(err)
+}
+
+// This function will true if terragrunt was invoked with renderJsonCommand
+func isRenderJsonCommand(terragruntOptions *options.TerragruntOptions) bool {
+	return util.ListContainsElement(terragruntOptions.TerraformCliArgs, renderJsonCommand)
 }
 
 // getOutputJsonWithCaching will run terragrunt output on the target config if it is not already cached.
@@ -348,6 +465,11 @@ func getOutputJsonWithCaching(targetConfig string, terragruntOptions *options.Te
 func cloneTerragruntOptionsForDependency(terragruntOptions *options.TerragruntOptions, targetConfig string) *options.TerragruntOptions {
 	targetOptions := terragruntOptions.Clone(targetConfig)
 	targetOptions.OriginalTerragruntConfigPath = targetConfig
+	// Clear IAMRoleOptions in case if it is different from one passed through CLI to allow dependencies to define own iam roles
+	// https://github.com/gruntwork-io/terragrunt/issues/1853#issuecomment-940102676
+	if targetOptions.IAMRoleOptions != targetOptions.OriginalIAMRoleOptions {
+		targetOptions.IAMRoleOptions = options.IAMRoleOptions{}
+	}
 	return targetOptions
 }
 
@@ -370,6 +492,20 @@ func cloneTerragruntOptionsForDependencyOutput(terragruntOptions *options.Terrag
 			return nil, errors.WithStackTrace(err)
 		}
 		targetOptions.DownloadDir = downloadDir
+	}
+
+	// Validate and use TerragruntVersionConstraints.TerraformBinary for dependency
+	partialTerragruntConfig, err := PartialParseConfigFile(
+		targetConfig,
+		targetOptions,
+		nil,
+		[]PartialDecodeSectionType{TerragruntVersionConstraints},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if partialTerragruntConfig.TerraformBinary != "" {
+		targetOptions.TerraformPath = partialTerragruntConfig.TerraformBinary
 	}
 
 	// If the Source is set, then we need to recompute it in the context of the target config.
@@ -431,9 +567,9 @@ func getTerragruntOutputJson(terragruntOptions *options.TerragruntOptions, targe
 		return nil, err
 	}
 	if isInit {
-		return getTerragruntOutputJsonFromInitFolder(targetTGOptions, workingDir, remoteStateTGConfig.IamRole)
+		return getTerragruntOutputJsonFromInitFolder(targetTGOptions, workingDir, remoteStateTGConfig.GetIAMRoleOptions())
 	}
-	return getTerragruntOutputJsonFromRemoteState(targetTGOptions, targetConfig, remoteStateTGConfig.RemoteState, remoteStateTGConfig.IamRole)
+	return getTerragruntOutputJsonFromRemoteState(targetTGOptions, targetConfig, remoteStateTGConfig.RemoteState, remoteStateTGConfig.GetIAMRoleOptions())
 }
 
 // canGetRemoteState returns true if the remote state block is not nil and dependency optimization is not disabled
@@ -481,12 +617,12 @@ func terragruntAlreadyInit(terragruntOptions *options.TerragruntOptions, configP
 
 // getTerragruntOutputJsonFromInitFolder will retrieve the outputs directly from the module's working directory without
 // running init.
-func getTerragruntOutputJsonFromInitFolder(terragruntOptions *options.TerragruntOptions, terraformWorkingDir string, iamRole string) ([]byte, error) {
+func getTerragruntOutputJsonFromInitFolder(terragruntOptions *options.TerragruntOptions, terraformWorkingDir string, iamRoleOpts options.IAMRoleOptions) ([]byte, error) {
 	targetConfig := terragruntOptions.TerragruntConfigPath
 
 	terragruntOptions.Logger.Debugf("Detected module %s is already init-ed. Retrieving outputs directly from working directory.", targetConfig)
 
-	targetTGOptions, err := setupTerragruntOptionsForBareTerraform(terragruntOptions, terraformWorkingDir, targetConfig, iamRole)
+	targetTGOptions, err := setupTerragruntOptionsForBareTerraform(terragruntOptions, terraformWorkingDir, targetConfig, iamRoleOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -513,10 +649,9 @@ func getTerragruntOutputJsonFromRemoteState(
 	terragruntOptions *options.TerragruntOptions,
 	targetConfig string,
 	remoteState *remote.RemoteState,
-	iamRole string,
+	iamRoleOpts options.IAMRoleOptions,
 ) ([]byte, error) {
 	terragruntOptions.Logger.Debugf("Detected remote state block with generate config. Resolving dependency by pulling remote state.")
-
 	// Create working directory where we will run terraform in. We will create the temporary directory in the download
 	// directory for consistency with other file generation capabilities of terragrunt. Make sure it is cleaned up
 	// before the function returns.
@@ -530,9 +665,27 @@ func getTerragruntOutputJsonFromRemoteState(
 	defer os.RemoveAll(tempWorkDir)
 	terragruntOptions.Logger.Debugf("Setting dependency working directory to %s", tempWorkDir)
 
-	targetTGOptions, err := setupTerragruntOptionsForBareTerraform(terragruntOptions, tempWorkDir, targetConfig, iamRole)
+	targetTGOptions, err := setupTerragruntOptionsForBareTerraform(terragruntOptions, tempWorkDir, targetConfig, iamRoleOpts)
 	if err != nil {
 		return nil, err
+	}
+
+	// To speed up dependencies processing it is possible to retrieve its output directly from the backend without init dependencies
+	if terragruntOptions.FetchDependencyOutputFromState {
+		switch backend := remoteState.Backend; backend {
+		case "s3":
+			jsonBytes, err := getTerragruntOutputJsonFromRemoteStateS3(
+				targetTGOptions,
+				remoteState,
+			)
+			if err != nil {
+				return nil, err
+			}
+			terragruntOptions.Logger.Debugf("Retrieved output from %s as json: %s using s3 bucket", targetConfig, jsonBytes)
+			return jsonBytes, nil
+		default:
+			terragruntOptions.Logger.Errorf("FetchDependencyOutputFromState is not supported for backend %s, falling back to normal method", backend)
+		}
 	}
 
 	// Generate the backend configuration in the working dir. If no generate config is set on the remote state block,
@@ -561,12 +714,60 @@ func getTerragruntOutputJsonFromRemoteState(
 	jsonString := out.Stdout
 	jsonBytes := []byte(strings.TrimSpace(jsonString))
 	terragruntOptions.Logger.Debugf("Retrieved output from %s as json: %s", targetConfig, jsonString)
+
 	return jsonBytes, nil
+
+}
+
+// getTerragruntOutputJsonFromRemoteStateS3 pulls the output directly from an S3 bucket without calling Terraform
+func getTerragruntOutputJsonFromRemoteStateS3(
+	terragruntOptions *options.TerragruntOptions,
+	remoteState *remote.RemoteState,
+) ([]byte, error) {
+	terragruntOptions.Logger.Debugf("Fetching outputs directly from s3://%s/%s", remoteState.Config["bucket"], remoteState.Config["key"])
+
+	s3ConfigExtended, err := remote.ParseExtendedS3Config(remoteState.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	sessionConfig := s3ConfigExtended.GetAwsSessionConfig()
+
+	s3Client, err := remote.CreateS3Client(sessionConfig, terragruntOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := s3Client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(fmt.Sprintf("%s", remoteState.Config["bucket"])),
+		Key:    aws.String(fmt.Sprintf("%s", remoteState.Config["key"])),
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer result.Body.Close()
+	steateBody, err := ioutil.ReadAll(result.Body)
+	if err != nil {
+		return nil, err
+	}
+	jsonState := string(steateBody)
+	jsonMap := make(map[string]interface{})
+	err = json.Unmarshal([]byte(jsonState), &jsonMap)
+	if err != nil {
+		return nil, err
+	}
+	jsonOutputs, err := json.Marshal(jsonMap["outputs"])
+	if err != nil {
+		return nil, err
+	}
+	return jsonOutputs, nil
 }
 
 // setupTerragruntOptionsForBareTerraform sets up a new TerragruntOptions struct that can be used to run terraform
 // without going through the full RunTerragrunt operation.
-func setupTerragruntOptionsForBareTerraform(originalOptions *options.TerragruntOptions, workingDir string, configPath string, iamRole string) (*options.TerragruntOptions, error) {
+func setupTerragruntOptionsForBareTerraform(originalOptions *options.TerragruntOptions, workingDir string, configPath string, iamRoleOpts options.IAMRoleOptions) (*options.TerragruntOptions, error) {
 	// Here we clone the terragrunt options again since we need to make further modifications to it to allow running
 	// terraform directly.
 	// Set the terraform working dir to the tempdir, and set stdout writer to ioutil.Discard so that output content is
@@ -577,9 +778,7 @@ func setupTerragruntOptionsForBareTerraform(originalOptions *options.TerragruntO
 
 	// If the target config has an IAM role directive and it was not set on the command line, set it to
 	// the one we retrieved from the config.
-	if iamRole != "" && targetTGOptions.IamRole == "" {
-		targetTGOptions.IamRole = iamRole
-	}
+	targetTGOptions.IAMRoleOptions = options.MergeIAMRoleOptions(iamRoleOpts, targetTGOptions.OriginalIAMRoleOptions)
 
 	// Make sure to assume any roles set by TERRAGRUNT_IAM_ROLE
 	if err := aws_helper.AssumeRoleAndUpdateEnvIfNecessary(targetTGOptions); err != nil {

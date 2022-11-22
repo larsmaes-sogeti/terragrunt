@@ -10,22 +10,22 @@ nav_title: Documentation
 nav_title_link: /docs/
 ---
 
-## Stack Overflow
+## Github Discussions
 
-Many developers use Stack Overflow to find help. Use the `terragrunt` tag to find [existing questions](https://stackoverflow.com/questions/tagged/terragrunt) or [ask your own](https://stackoverflow.com/questions/ask?tags=terragrunt).
+Search our [Knowledge Base](https://github.com/gruntwork-io/knowledge-base/discussions) to find existing questions or ask your own. Github Discussions is a good place for general discussions and questions.
 
 ## Github Issues
 
 Read through [existing issues](https://github.com/gruntwork-io/terragrunt/issues) or post a new one. Github issues is a good place to:
 
-  - report a bug,
+- report a bug,
 
-  - ask for a help,
+- ask for a help,
 
-  - ask for improvements,
+- ask for improvements,
 
-  - to start contributing by solving simple issues.
+- to start contributing by solving simple issues.
 
 ## Commercial support
 
-Does your company rely on Terragrunt in production? If so, you can get commercial support directly from Gruntwork, the creators of Terragrunt! Check out the [Commercial Support Page](/commercial-support/) for more details.
+Does your company rely on Terragrunt in production? If so, you can get commercial support directly from Gruntwork, the creators of Terragrunt! Check out the [Gruntwork Support Page](https://gruntwork.io/support) for more details.

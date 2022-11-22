@@ -5,7 +5,7 @@ category: features
 categories_url: features
 excerpt: Learn how to avoid tedious tasks of running commands on each module separately.
 tags: ["DRY", "Modules", "Use cases", "CLI"]
-order: 203
+order: 220
 nav_title: Documentation
 nav_title_link: /docs/
 ---
@@ -86,7 +86,7 @@ Finally, if you make some changes to your project, you could evaluate the impact
 Note: It is important to realize that you could get errors running `run-all plan` if you have dependencies between your
 projects and some of those dependencies haven’t been applied yet.
 
-*Ex: If module A depends on module B and module B hasn’t been applied yet, then plan-all will show the plan for B, but exit with an error when trying to show the plan for A.*
+*Ex: If module A depends on module B and module B hasn’t been applied yet, then run-all plan will show the plan for B, but exit with an error when trying to show the plan for A.*
 
     cd root
     terragrunt run-all plan
@@ -160,11 +160,11 @@ If any of the modules failed to deploy, then Terragrunt will not attempt to depl
 
 Terragrunt will return an error indicating the dependency hasn’t been applied yet if the terraform module managed by the terragrunt config referenced in a `dependency` block has not been applied yet. This is because you cannot actually fetch outputs out of an unapplied Terraform module, even if there are no resources being created in the module.
 
-This is most problematic when running commands that do not modify state (e.g `plan-all` and `validate-all`) on a completely new setup where no infrastructure has been deployed. You won’t be able to `plan` or `validate` a module if you can’t determine the `inputs`. If the module depends on the outputs of another module that hasn’t been applied yet, you won’t be able to compute the `inputs` unless the dependencies are all applied. However, in real life usage, you would want to run `validate-all` or `plan-all` on a completely new set of infrastructure.
+This is most problematic when running commands that do not modify state (e.g `run-all plan` and `run-all validate`) on a completely new setup where no infrastructure has been deployed. You won’t be able to `plan` or `validate` a module if you can’t determine the `inputs`. If the module depends on the outputs of another module that hasn’t been applied yet, you won’t be able to compute the `inputs` unless the dependencies are all applied. However, in real life usage, you would want to run `run-all validate` or `run-all plan` on a completely new set of infrastructure.
 
 To address this, you can provide mock outputs to use when a module hasn’t been applied yet. This is configured using the `mock_outputs` attribute on the `dependency` block and it corresponds to a map that will be injected in place of the actual dependency outputs if the target config hasn’t been applied yet.
 
-For example, in the previous example with a `mysql` module and `vpc` module, suppose you wanted to place in a temporary, dummy value for the `vpc_id` during a `validate-all` for the `mysql` module. You can specify in `mysql/terragrunt.hcl`:
+For example, in the previous example with a `mysql` module and `vpc` module, suppose you wanted to place in a temporary, dummy value for the `vpc_id` during a `run-all validate` for the `mysql` module. You can specify in `mysql/terragrunt.hcl`:
 
     dependency "vpc" {
       config_path = "../vpc"
@@ -197,7 +197,7 @@ You can use the `mock_outputs_allowed_terraform_commands` attribute to indicate 
       vpc_id = dependency.vpc.outputs.vpc_id
     }
 
-Note that indicating `validate` means that the `mock_outputs` will be used either with `validate` or with `validate-all`.
+Note that indicating `validate` means that the `mock_outputs` will be used either with `validate` or with `run-all validate`.
 
 You can also use `skip_outputs` on the `dependency` block to specify the dependency without pulling in the outputs:
 
@@ -216,6 +216,20 @@ When `skip_outputs` is used with `mock_outputs`, mocked outputs will be returned
 
       skip_outputs = true
     }
+
+You can also use `mock_outputs_merge_strategy_with_state` on the `dependency` block to merge the mocked outputs and the state outputs :
+
+    dependency "vpc" {
+      config_path = "../vpc"
+      mock_outputs = {
+        vpc_id     = "temporary-dummy-id"
+        new_output = "temporary-dummy-value"
+      }
+
+      mock_outputs_merge_strategy_with_state = "shallow"
+    }
+
+If the state outputs only contains `vpc_id`, this value will be preserved. And `new_output` which is not existing, the mock value will be used.
 
 ### Dependencies between modules
 
@@ -278,7 +292,7 @@ Once you’ve specified the dependencies in each `terragrunt.hcl` file, when you
 
 If any of the modules fail to deploy, then Terragrunt will not attempt to deploy the modules that depend on them. Once you’ve fixed the error, it’s usually safe to re-run the `run-all apply` or `run-all destroy` command again, since it’ll be a no-op for the modules that already deployed successfully, and should only affect the ones that had an error the last time around.
 
-To check all of your dependencies and validate the code in them, you can use the `validate-all` command.
+To check all of your dependencies and validate the code in them, you can use the `run-all validate` command.
 
 To check the dependency graph you can use the `graph-dependencies` command (similar to the `terraform graph` command),
 the graph is output in DOT format The typical program that can read this format is GraphViz, but many web services are also available to read this format.
@@ -291,6 +305,8 @@ In the example above it'll generate this graph
 
 Note that this graph shows the dependency relationship in the direction of the arrow (top down), however terragrunt will run the action
 in reverse order (bottom up)
+
+**Note:** During execution of `destroy` command, Terragrunt will try to find all dependent modules and show a confirmation prompt with a list of all detected dependencies, because once resources will be destroyed, any commands on dependent modules will fail with missing dependencies. For example, if `destroy` was called on the `redis` module, you will be asked to confirm the action because `backend-app` depends on `redis`. You can avoid the prompt by using `--terragrunt-non-interactive`.
 
 ### Testing multiple modules locally
 

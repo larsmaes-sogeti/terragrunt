@@ -1,9 +1,12 @@
 package configstack
 
 import (
+	"bytes"
 	"os"
+	"strings"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gruntwork-io/terragrunt/config"
@@ -70,6 +73,9 @@ func TestResolveTerraformModulesOneModuleWithIncludesNoDependencies(t *testing.T
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/module-b/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/module-b/module-b-child/"+config.DefaultTerragruntConfigPath)),
 	}
@@ -91,6 +97,9 @@ func TestResolveTerraformModulesOneJsonModuleWithIncludesNoDependencies(t *testi
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/json-module-b/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/json-module-b/module-b-child/"+config.DefaultTerragruntJsonConfigPath)),
 	}
@@ -112,6 +121,9 @@ func TestResolveTerraformModulesOneHclModuleWithIncludesNoDependencies(t *testin
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/hcl-module-b/terragrunt.hcl.json")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/hcl-module-b/module-b-child/"+config.DefaultTerragruntConfigPath)),
 	}
@@ -541,6 +553,9 @@ func TestResolveTerraformModulesMultipleModulesWithDependencies(t *testing.T) {
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/module-b/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/module-b/module-b-child/"+config.DefaultTerragruntConfigPath)),
 	}
@@ -590,6 +605,9 @@ func TestResolveTerraformModulesMultipleModulesWithMixedDependencies(t *testing.
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/json-module-b/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/json-module-b/module-b-child/"+config.DefaultTerragruntJsonConfigPath)),
 	}
@@ -639,6 +657,9 @@ func TestResolveTerraformModulesMultipleModulesWithDependenciesWithIncludes(t *t
 		Config: config.TerragruntConfig{
 			Terraform: &config.TerraformConfig{Source: ptr("...")},
 			IsPartial: true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/module-b/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/module-b/module-b-child/"+config.DefaultTerragruntConfigPath)),
 	}
@@ -650,6 +671,9 @@ func TestResolveTerraformModulesMultipleModulesWithDependenciesWithIncludes(t *t
 			Dependencies: &config.ModuleDependencies{Paths: []string{"../../module-a", "../../module-b/module-b-child"}},
 			Terraform:    &config.TerraformConfig{Source: ptr("test")},
 			IsPartial:    true,
+			ProcessedIncludes: map[string]config.IncludeConfig{
+				"": {Path: canonical(t, "../test/fixture-modules/module-e/terragrunt.hcl")},
+			},
 		},
 		TerragruntOptions: mockOptions.Clone(canonical(t, "../test/fixture-modules/module-e/module-e-child/"+config.DefaultTerragruntConfigPath)),
 	}
@@ -772,4 +796,39 @@ func TestResolveTerraformModuleNoTerraformConfig(t *testing.T) {
 
 func ptr(str string) *string {
 	return &str
+}
+
+func TestLogReductionHook(t *testing.T) {
+	t.Parallel()
+	var hook = NewForceLogLevelHook(logrus.ErrorLevel)
+
+	stdout := bytes.Buffer{}
+
+	var testLogger = logrus.New()
+	testLogger.Out = &stdout
+	testLogger.AddHook(hook)
+	testLogger.Level = logrus.DebugLevel
+
+	logrus.NewEntry(testLogger).Info("Test tomato")
+	logrus.NewEntry(testLogger).Error("666 potato 111")
+
+	out := stdout.String()
+
+	var firstLogEntry = ""
+	var secondLogEntry = ""
+
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "tomato") {
+			firstLogEntry = line
+			continue
+		}
+		if strings.Contains(line, "potato") {
+			secondLogEntry = line
+			continue
+		}
+	}
+	// check that both entries got logged with error level
+	assert.Contains(t, firstLogEntry, "level=error")
+	assert.Contains(t, secondLogEntry, "level=error")
+
 }

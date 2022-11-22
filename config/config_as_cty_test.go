@@ -18,6 +18,7 @@ import (
 func TestTerragruntConfigAsCtyDrift(t *testing.T) {
 	testSource := "./foo"
 	testTrue := true
+	testFalse := false
 	mockOutputs := cty.Zero
 	mockOutputsAllowedTerraformCommands := []string{"init"}
 	testConfig := TerragruntConfig{
@@ -41,6 +42,14 @@ func TestTerragruntConfigAsCtyDrift(t *testing.T) {
 					Name:     "init",
 					Commands: []string{"init"},
 					Execute:  []string{"true"},
+				},
+			},
+			ErrorHooks: []ErrorHook{
+				ErrorHook{
+					Name:     "init",
+					Commands: []string{"init"},
+					Execute:  []string{"true"},
+					OnErrors: []string{".*"},
 				},
 			},
 		},
@@ -75,6 +84,7 @@ func TestTerragruntConfigAsCtyDrift(t *testing.T) {
 				SkipOutputs:                         &testTrue,
 				MockOutputs:                         &mockOutputs,
 				MockOutputsAllowedTerraformCommands: &mockOutputsAllowedTerraformCommands,
+				MockOutputsMergeWithState:           &testFalse,
 				RenderedOutputs:                     &mockOutputs,
 			},
 		},
@@ -90,7 +100,7 @@ func TestTerragruntConfigAsCtyDrift(t *testing.T) {
 			},
 		},
 	}
-	ctyVal, err := terragruntConfigAsCty(&testConfig)
+	ctyVal, err := TerragruntConfigAsCty(&testConfig)
 	require.NoError(t, err)
 
 	ctyMap, err := parseCtyValueToMap(ctyVal)
@@ -108,7 +118,7 @@ func TestTerragruntConfigAsCtyDrift(t *testing.T) {
 			checked[mapKey] = true
 		}
 	}
-	for key, _ := range ctyMap {
+	for key := range ctyMap {
 		_, hasKey := checked[key]
 		assert.Truef(t, hasKey, "cty value key %s is not accounted for from struct field", key)
 	}
@@ -147,7 +157,7 @@ func TestRemoteStateAsCtyDrift(t *testing.T) {
 			checked[mapKey] = true
 		}
 	}
-	for key, _ := range ctyMap {
+	for key := range ctyMap {
 		_, hasKey := checked[key]
 		assert.Truef(t, hasKey, "cty value key %s is not accounted for from struct field", key)
 	}
@@ -189,6 +199,8 @@ func terragruntConfigStructFieldToMapKey(t *testing.T, fieldName string) (string
 		return "iam_role", true
 	case "IamAssumeRoleDuration":
 		return "iam_assume_role_duration", true
+	case "IamAssumeRoleSessionName":
+		return "iam_assume_role_session_name", true
 	case "Inputs":
 		return "inputs", true
 	case "Locals":
@@ -198,6 +210,10 @@ func terragruntConfigStructFieldToMapKey(t *testing.T, fieldName string) (string
 	case "GenerateConfigs":
 		return "generate", true
 	case "IsPartial":
+		return "", false
+	case "ProcessedIncludes":
+		return "", false
+	case "FieldsMetadata":
 		return "", false
 	case "RetryableErrors":
 		return "retryable_errors", true

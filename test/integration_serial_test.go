@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,7 +24,7 @@ import (
 // NOTE: We don't run these tests in parallel because it modifies the environment variable, so it can affect other tests
 
 func TestTerragruntDownloadDir(t *testing.T) {
-	cleanupTerraformFolder(t, TEST_FIXTURE_LOCAL_RELATIVE_DOWNLOAD_PATH)
+	cleanupTerraformFolder(t, testFixtureLocalRelativeDownloadPath)
 	tmpEnvPath := copyEnvironment(t, TEST_FIXTURE_GET_OUTPUT)
 
 	/* we have 2 terragrunt dirs here. One of them doesn't set the download_dir in the config,
@@ -205,7 +209,8 @@ func TestTerragruntValidateInputsWithUnusedEnvVar(t *testing.T) {
 	defer os.Unsetenv("TF_VAR_unused")
 
 	moduleDir := filepath.Join("fixture-validate-inputs", "success-inputs-only")
-	runTerragruntValidateInputs(t, moduleDir, nil, false)
+	args := []string{"--terragrunt-strict-validate"}
+	runTerragruntValidateInputs(t, moduleDir, args, false)
 }
 
 func TestTerragruntSourceMapEnvArg(t *testing.T) {
@@ -227,4 +232,123 @@ func TestTerragruntSourceMapEnvArg(t *testing.T) {
 	tgPath := filepath.Join(rootPath, "multiple-match")
 	tgArgs := fmt.Sprintf("terragrunt run-all apply -auto-approve --terragrunt-log-level debug --terragrunt-non-interactive --terragrunt-working-dir %s", tgPath)
 	runTerragrunt(t, tgArgs)
+}
+
+func TestTerragruntLogLevelEnvVarOverridesDefault(t *testing.T) {
+	// NOTE: this matches logLevelEnvVar const in util/logger.go
+	envVarName := "TERRAGRUNT_LOG_LEVEL"
+	oldVal := os.Getenv(envVarName)
+	defer func() {
+		if oldVal != "" {
+			os.Setenv(envVarName, oldVal)
+		} else {
+			os.Unsetenv(envVarName)
+		}
+	}()
+	os.Setenv("TERRAGRUNT_LOG_LEVEL", "debug")
+
+	cleanupTerraformFolder(t, TEST_FIXTURE_INPUTS)
+	tmpEnvPath := copyEnvironment(t, ".")
+	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_INPUTS)
+
+	var (
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	)
+
+	require.NoError(
+		t,
+		runTerragruntCommand(t, fmt.Sprintf("terragrunt validate --terragrunt-non-interactive --terragrunt-working-dir %s", rootPath), &stdout, &stderr),
+	)
+	output := stderr.String()
+	assert.Contains(t, output, "level=debug")
+}
+
+func TestTerragruntLogLevelEnvVarUnparsableLogsErrorButContinues(t *testing.T) {
+	// NOTE: this matches logLevelEnvVar const in util/logger.go
+	envVarName := "TERRAGRUNT_LOG_LEVEL"
+	oldVal := os.Getenv(envVarName)
+	defer func() {
+		if oldVal != "" {
+			os.Setenv(envVarName, oldVal)
+		} else {
+			os.Unsetenv(envVarName)
+		}
+	}()
+	os.Setenv("TERRAGRUNT_LOG_LEVEL", "unparsable")
+
+	cleanupTerraformFolder(t, TEST_FIXTURE_INPUTS)
+	tmpEnvPath := copyEnvironment(t, ".")
+	rootPath := util.JoinPath(tmpEnvPath, TEST_FIXTURE_INPUTS)
+
+	// Ideally, we would check stderr to introspect the error message, but the global fallback logger only logs to real
+	// stderr and we can't capture the output, so in this case we only make sure that the command runs successfully to
+	// completion.
+	runTerragrunt(t, fmt.Sprintf("terragrunt validate --terragrunt-non-interactive --terragrunt-working-dir %s", rootPath))
+}
+
+// NOTE: the following test requires precise timing for determining parallelism. As such, it can not be run in parallel
+// with all the other tests as the system load could impact the duration in which the parallel terragrunt goroutines
+// run.
+
+func testTerragruntParallelism(t *testing.T, parallelism int, numberOfModules int, timeToDeployEachModule time.Duration, expectedTimings []int) {
+	output, testStart, err := testRemoteFixtureParallelism(t, parallelism, numberOfModules, timeToDeployEachModule)
+	require.NoError(t, err)
+
+	// parse output and sort the times, the regex captures a string in the format time.RFC3339 emitted by terraform's timestamp function
+	r, err := regexp.Compile(`out = "([-:\w]+)"`)
+	require.NoError(t, err)
+
+	matches := r.FindAllStringSubmatch(output, -1)
+	assert.Equal(t, numberOfModules, len(matches))
+	var times []int
+	for _, v := range matches {
+		// timestamp() is parsed
+		parsed, err := time.Parse(time.RFC3339, v[1])
+		require.NoError(t, err)
+		times = append(times, int(parsed.Unix())-testStart)
+	}
+	sort.Slice(times, func(i, j int) bool {
+		return times[i] < times[j]
+	})
+
+	// the reported times are skewed (running terragrunt/terraform apply adds a little bit of overhead)
+	// we apply a simple scaling algorithm on the times based on the last expected time and the last actual time
+	k := float64(times[len(times)-1]) / float64(expectedTimings[len(expectedTimings)-1])
+
+	scaledTimes := make([]float64, len(times))
+	for i := 0; i < len(times); i++ {
+		scaledTimes[i] = float64(times[i]) / k
+	}
+
+	t.Logf("Parallelism test numberOfModules=%d p=%d expectedTimes=%v times=%v scaledTimes=%v scaleFactor=%f", numberOfModules, parallelism, expectedTimings, times, scaledTimes, k)
+
+	maxDiffInSeconds := 3.0
+	isEqual := func(x, y float64) bool {
+		return math.Abs(x-y) <= maxDiffInSeconds
+	}
+	for i := 0; i < len(times); i++ {
+		// it's impossible to know when will the first test finish however once a test finishes
+		// we know that all the other times are relative to the first one
+		assert.True(t, isEqual(scaledTimes[i], float64(expectedTimings[i])))
+	}
+}
+
+func TestTerragruntParallelism(t *testing.T) {
+	testCases := []struct {
+		parallelism            int
+		numberOfModules        int
+		timeToDeployEachModule time.Duration
+		expectedTimings        []int
+	}{
+		{1, 10, 5 * time.Second, []int{5, 10, 15, 20, 25, 30, 35, 40, 45, 50}},
+		{3, 10, 5 * time.Second, []int{5, 5, 5, 10, 10, 10, 15, 15, 15, 20}},
+		{5, 10, 5 * time.Second, []int{5, 5, 5, 5, 5, 5, 5, 5, 5, 5}},
+	}
+	for _, tc := range testCases {
+		tc := tc // shadow and force execution with this case
+		t.Run(fmt.Sprintf("parallelism=%d numberOfModules=%d timeToDeployEachModule=%v expectedTimings=%v", tc.parallelism, tc.numberOfModules, tc.timeToDeployEachModule, tc.expectedTimings), func(t *testing.T) {
+			testTerragruntParallelism(t, tc.parallelism, tc.numberOfModules, tc.timeToDeployEachModule, tc.expectedTimings)
+		})
+	}
 }

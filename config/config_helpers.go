@@ -2,12 +2,13 @@ package config
 
 import (
 	"fmt"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"unicode/utf8"
+
+	"go.mozilla.org/sops/v3/cmd/sops/formats"
 
 	"github.com/hashicorp/go-getter"
 	"github.com/hashicorp/hcl/v2"
@@ -70,9 +71,13 @@ type EnvVar struct {
 // TrackInclude is used to differentiate between an included config in the current parsing context, and an included
 // config that was passed through from a previous parsing context.
 type TrackInclude struct {
-	// Current is used to specify another config that should be imported and merged before the final
-	// TerragruntConfig is returned.
-	Current *IncludeConfig
+	// CurrentList is used to track the list of configs that should be imported and merged before the final
+	// TerragruntConfig is returned. This preserves the order of the blocks as they appear in the config, so that we can
+	// merge the included config in the right order.
+	CurrentList []IncludeConfig
+
+	// CurrentMap is the map version of CurrentList that maps the block labels to the included config.
+	CurrentMap map[string]IncludeConfig
 
 	// Original is used to track the original included config, and is used for resolving the include related
 	// functions.
@@ -82,7 +87,7 @@ type TrackInclude struct {
 // EvalContextExtensions provides various extensions to the evaluation context to enhance the parsing capabilities.
 type EvalContextExtensions struct {
 	// TrackInclude represents contexts of included configurations.
-	TrackInclude TrackInclude
+	TrackInclude *TrackInclude
 
 	// Locals are preevaluated variable bindings that can be used by reference in the code.
 	Locals *cty.Value
@@ -92,6 +97,11 @@ type EvalContextExtensions struct {
 	// - outputs: The map of outputs from the terraform state obtained by running `terragrunt output` on that target
 	//            config.
 	DecodedDependencies *cty.Value
+
+	// PartialParseDecodeList is the list of sections that are being decoded in the current config. This can be used to
+	// indicate/detect that the current parsing context is partial, meaning that not all configuration values are
+	// expected to be available.
+	PartialParseDecodeList []PartialDecodeSectionType
 }
 
 // Create an EvalContext for the HCL2 parser. We can define functions and variables in this context that the HCL2 parser
@@ -106,27 +116,37 @@ func CreateTerragruntEvalContext(
 	}
 
 	terragruntFunctions := map[string]function.Function{
-		"find_in_parent_folders":                       wrapStringSliceToStringAsFuncImpl(findInParentFolders, extensions.TrackInclude.Original, terragruntOptions),
-		"path_relative_to_include":                     wrapVoidToStringAsFuncImpl(pathRelativeToInclude, extensions.TrackInclude.Original, terragruntOptions),
-		"path_relative_from_include":                   wrapVoidToStringAsFuncImpl(pathRelativeFromInclude, extensions.TrackInclude.Original, terragruntOptions),
-		"get_env":                                      wrapStringSliceToStringAsFuncImpl(getEnvironmentVariable, extensions.TrackInclude.Original, terragruntOptions),
-		"run_cmd":                                      wrapStringSliceToStringAsFuncImpl(runCommand, extensions.TrackInclude.Original, terragruntOptions),
+		"find_in_parent_folders":                       wrapStringSliceToStringAsFuncImpl(findInParentFolders, extensions.TrackInclude, terragruntOptions),
+		"path_relative_to_include":                     wrapStringSliceToStringAsFuncImpl(pathRelativeToInclude, extensions.TrackInclude, terragruntOptions),
+		"path_relative_from_include":                   wrapStringSliceToStringAsFuncImpl(pathRelativeFromInclude, extensions.TrackInclude, terragruntOptions),
+		"get_env":                                      wrapStringSliceToStringAsFuncImpl(getEnvironmentVariable, extensions.TrackInclude, terragruntOptions),
+		"run_cmd":                                      wrapStringSliceToStringAsFuncImpl(runCommand, extensions.TrackInclude, terragruntOptions),
 		"read_terragrunt_config":                       readTerragruntConfigAsFuncImpl(terragruntOptions),
-		"get_platform":                                 wrapVoidToStringAsFuncImpl(getPlatform, extensions.TrackInclude.Original, terragruntOptions),
-		"get_terragrunt_dir":                           wrapVoidToStringAsFuncImpl(getTerragruntDir, extensions.TrackInclude.Original, terragruntOptions),
-		"get_original_terragrunt_dir":                  wrapVoidToStringAsFuncImpl(getOriginalTerragruntDir, extensions.TrackInclude.Original, terragruntOptions),
-		"get_terraform_command":                        wrapVoidToStringAsFuncImpl(getTerraformCommand, extensions.TrackInclude.Original, terragruntOptions),
-		"get_terraform_cli_args":                       wrapVoidToStringSliceAsFuncImpl(getTerraformCliArgs, extensions.TrackInclude.Original, terragruntOptions),
-		"get_parent_terragrunt_dir":                    wrapVoidToStringAsFuncImpl(getParentTerragruntDir, extensions.TrackInclude.Original, terragruntOptions),
-		"get_aws_account_id":                           wrapVoidToStringAsFuncImpl(getAWSAccountID, extensions.TrackInclude.Original, terragruntOptions),
-		"get_aws_caller_identity_arn":                  wrapVoidToStringAsFuncImpl(getAWSCallerIdentityARN, extensions.TrackInclude.Original, terragruntOptions),
-		"get_aws_caller_identity_user_id":              wrapVoidToStringAsFuncImpl(getAWSCallerIdentityUserID, extensions.TrackInclude.Original, terragruntOptions),
+		"get_platform":                                 wrapVoidToStringAsFuncImpl(getPlatform, extensions.TrackInclude, terragruntOptions),
+		"get_repo_root":                                wrapVoidToStringAsFuncImpl(getRepoRoot, extensions.TrackInclude, terragruntOptions),
+		"get_path_from_repo_root":                      wrapVoidToStringAsFuncImpl(getPathFromRepoRoot, extensions.TrackInclude, terragruntOptions),
+		"get_path_to_repo_root":                        wrapVoidToStringAsFuncImpl(getPathToRepoRoot, extensions.TrackInclude, terragruntOptions),
+		"get_terragrunt_dir":                           wrapVoidToStringAsFuncImpl(getTerragruntDir, extensions.TrackInclude, terragruntOptions),
+		"get_original_terragrunt_dir":                  wrapVoidToStringAsFuncImpl(getOriginalTerragruntDir, extensions.TrackInclude, terragruntOptions),
+		"get_terraform_command":                        wrapVoidToStringAsFuncImpl(getTerraformCommand, extensions.TrackInclude, terragruntOptions),
+		"get_terraform_cli_args":                       wrapVoidToStringSliceAsFuncImpl(getTerraformCliArgs, extensions.TrackInclude, terragruntOptions),
+		"get_parent_terragrunt_dir":                    wrapStringSliceToStringAsFuncImpl(getParentTerragruntDir, extensions.TrackInclude, terragruntOptions),
+		"get_aws_account_id":                           wrapVoidToStringAsFuncImpl(getAWSAccountID, extensions.TrackInclude, terragruntOptions),
+		"get_aws_caller_identity_arn":                  wrapVoidToStringAsFuncImpl(getAWSCallerIdentityARN, extensions.TrackInclude, terragruntOptions),
+		"get_aws_caller_identity_user_id":              wrapVoidToStringAsFuncImpl(getAWSCallerIdentityUserID, extensions.TrackInclude, terragruntOptions),
 		"get_terraform_commands_that_need_vars":        wrapStaticValueToStringSliceAsFuncImpl(TERRAFORM_COMMANDS_NEED_VARS),
 		"get_terraform_commands_that_need_locking":     wrapStaticValueToStringSliceAsFuncImpl(TERRAFORM_COMMANDS_NEED_LOCKING),
 		"get_terraform_commands_that_need_input":       wrapStaticValueToStringSliceAsFuncImpl(TERRAFORM_COMMANDS_NEED_INPUT),
 		"get_terraform_commands_that_need_parallelism": wrapStaticValueToStringSliceAsFuncImpl(TERRAFORM_COMMANDS_NEED_PARALLELISM),
-		"sops_decrypt_file":                            wrapStringSliceToStringAsFuncImpl(sopsDecryptFile, extensions.TrackInclude.Original, terragruntOptions),
-		"get_terragrunt_source_cli_flag":               wrapVoidToStringAsFuncImpl(getTerragruntSourceCliFlag, extensions.TrackInclude.Original, terragruntOptions),
+		"sops_decrypt_file":                            wrapStringSliceToStringAsFuncImpl(sopsDecryptFile, extensions.TrackInclude, terragruntOptions),
+		"get_terragrunt_source_cli_flag":               wrapVoidToStringAsFuncImpl(getTerragruntSourceCliFlag, extensions.TrackInclude, terragruntOptions),
+	}
+
+	// Map with HCL functions introduced in Terraform after v0.15.3, since upgrade to a later version is not supported
+	// https://github.com/gruntwork-io/terragrunt/blob/master/go.mod#L22
+	terraformCompatibilityFunctions := map[string]function.Function{
+		"startswith": wrapStringSliceToBoolAsFuncImpl(startsWith, extensions.TrackInclude, terragruntOptions),
+		"endswith":   wrapStringSliceToBoolAsFuncImpl(endsWith, extensions.TrackInclude, terragruntOptions),
 	}
 
 	functions := map[string]function.Function{}
@@ -134,6 +154,9 @@ func CreateTerragruntEvalContext(
 		functions[k] = v
 	}
 	for k, v := range terragruntFunctions {
+		functions[k] = v
+	}
+	for k, v := range terraformCompatibilityFunctions {
 		functions[k] = v
 	}
 
@@ -147,29 +170,60 @@ func CreateTerragruntEvalContext(
 	if extensions.DecodedDependencies != nil {
 		ctx.Variables["dependency"] = *extensions.DecodedDependencies
 	}
-	if extensions.TrackInclude.Current != nil && extensions.TrackInclude.Current.GetExpose() {
-		includedConfig, err := parseIncludedConfig(extensions.TrackInclude.Current, terragruntOptions)
+	if extensions.TrackInclude != nil && len(extensions.TrackInclude.CurrentList) > 0 {
+		// For each include block, check if we want to expose the included config, and if so, add under the include
+		// variable.
+		exposedInclude, err := includeMapAsCtyVal(extensions.TrackInclude.CurrentMap, terragruntOptions, extensions.DecodedDependencies, extensions.PartialParseDecodeList)
 		if err != nil {
 			return ctx, err
 		}
-
-		// MAINTAINER'S NOTE: For now, we don't support multiple include blocks in a terragrunt config. In the future,
-		// when we support multiple include blocks, expose each included config indexed by the label.
-		ctx.Variables["include"], err = terragruntConfigAsCty(includedConfig)
-		if err != nil {
-			return ctx, err
-		}
+		ctx.Variables["include"] = exposedInclude
 	}
 	return ctx, nil
 }
 
 // Return the OS platform
-func getPlatform(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getPlatform(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	return runtime.GOOS, nil
 }
 
+// Return the repository root as an absolute path
+func getRepoRoot(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	return shell.GitTopLevelDir(terragruntOptions, terragruntOptions.WorkingDir)
+}
+
+// Return the path from the repository root
+func getPathFromRepoRoot(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	repoAbsPath, err := shell.GitTopLevelDir(terragruntOptions, terragruntOptions.WorkingDir)
+	if err != nil {
+		return "", errors.WithStackTrace(err)
+	}
+
+	repoRelPath, err := filepath.Rel(repoAbsPath, terragruntOptions.WorkingDir)
+	if err != nil {
+		return "", errors.WithStackTrace(err)
+	}
+
+	return filepath.ToSlash(repoRelPath), nil
+}
+
+// Return the path to the repository root
+func getPathToRepoRoot(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	repoAbsPath, err := shell.GitTopLevelDir(terragruntOptions, terragruntOptions.WorkingDir)
+	if err != nil {
+		return "", errors.WithStackTrace(err)
+	}
+
+	repoRootPathAbs, err := filepath.Rel(terragruntOptions.WorkingDir, string(repoAbsPath))
+	if err != nil {
+		return "", errors.WithStackTrace(err)
+	}
+
+	return filepath.ToSlash(strings.TrimSpace(repoRootPathAbs) + "/"), nil
+}
+
 // Return the directory where the Terragrunt configuration file lives
-func getTerragruntDir(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getTerragruntDir(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	terragruntConfigFileAbsPath, err := filepath.Abs(terragruntOptions.TerragruntConfigPath)
 	if err != nil {
 		return "", errors.WithStackTrace(err)
@@ -182,7 +236,7 @@ func getTerragruntDir(include *IncludeConfig, terragruntOptions *options.Terragr
 // Terragrunt config is being read from another e.g., if /terraform-code/terragrunt.hcl
 // calls read_terragrunt_config("/foo/bar.hcl"), and within bar.hcl, you call get_original_terragrunt_dir(), you'll
 // get back /terraform-code.
-func getOriginalTerragruntDir(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getOriginalTerragruntDir(trackIncude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	terragruntConfigFileAbsPath, err := filepath.Abs(terragruntOptions.OriginalTerragruntConfigPath)
 	if err != nil {
 		return "", errors.WithStackTrace(err)
@@ -192,8 +246,8 @@ func getOriginalTerragruntDir(include *IncludeConfig, terragruntOptions *options
 }
 
 // Return the parent directory where the Terragrunt configuration file lives
-func getParentTerragruntDir(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
-	parentPath, err := pathRelativeFromInclude(include, terragruntOptions)
+func getParentTerragruntDir(params []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	parentPath, err := pathRelativeFromInclude(params, trackInclude, terragruntOptions)
 	if err != nil {
 		return "", errors.WithStackTrace(err)
 	}
@@ -227,9 +281,14 @@ func parseGetEnvParameters(parameters []string) (EnvVar, error) {
 	return envVariable, nil
 }
 
+// runCommandCache - cache of evaluated `run_cmd` invocations
+// see: https://github.com/gruntwork-io/terragrunt/issues/1427
+var runCommandCache = NewStringCache()
+
 // runCommand is a helper function that runs a command and returns the stdout as the interporation
+// for each `run_cmd` in locals section, function is called twice
 // result
-func runCommand(args []string, include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func runCommand(args []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	if len(args) == 0 {
 		return "", errors.WithStackTrace(EmptyStringNotAllowed("parameter to the run_cmd function"))
 	}
@@ -241,6 +300,19 @@ func runCommand(args []string, include *IncludeConfig, terragruntOptions *option
 	}
 
 	currentPath := filepath.Dir(terragruntOptions.TerragruntConfigPath)
+
+	// To avoid re-run of the same run_cmd command, is used in memory cache for command results, with caching key path + arguments
+	// see: https://github.com/gruntwork-io/terragrunt/issues/1427
+	cacheKey := fmt.Sprintf("%v-%v", currentPath, args)
+	cachedValue, foundInCache := runCommandCache.Get(cacheKey)
+	if foundInCache {
+		if suppressOutput {
+			terragruntOptions.Logger.Debugf("run_cmd, cached output: [REDACTED]")
+		} else {
+			terragruntOptions.Logger.Debugf("run_cmd, cached output: [%s]", cachedValue)
+		}
+		return cachedValue, nil
+	}
 
 	cmdOutput, err := shell.RunShellCommandWithOutput(terragruntOptions, currentPath, suppressOutput, false, args[0], args[1:]...)
 	if err != nil {
@@ -255,10 +327,13 @@ func runCommand(args []string, include *IncludeConfig, terragruntOptions *option
 		terragruntOptions.Logger.Debugf("run_cmd output: [%s]", value)
 	}
 
+	// Persisting result in cache to avoid future re-evaluation
+	// see: https://github.com/gruntwork-io/terragrunt/issues/1427
+	runCommandCache.Put(cacheKey, value)
 	return value, nil
 }
 
-func getEnvironmentVariable(parameters []string, include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getEnvironmentVariable(parameters []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	parameterMap, err := parseGetEnvParameters(parameters)
 
 	if err != nil {
@@ -278,7 +353,11 @@ func getEnvironmentVariable(parameters []string, include *IncludeConfig, terragr
 
 // Find a parent Terragrunt configuration file in the parent folders above the current Terragrunt configuration file
 // and return its path
-func findInParentFolders(params []string, include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func findInParentFolders(
+	params []string,
+	trackInclude *TrackInclude,
+	terragruntOptions *options.TerragruntOptions,
+) (string, error) {
 	numParams := len(params)
 
 	var fileToFindParam string
@@ -295,11 +374,11 @@ func findInParentFolders(params []string, include *IncludeConfig, terragruntOpti
 	}
 
 	previousDir, err := filepath.Abs(filepath.Dir(terragruntOptions.TerragruntConfigPath))
-	previousDir = filepath.ToSlash(previousDir)
-
 	if err != nil {
 		return "", errors.WithStackTrace(err)
 	}
+
+	previousDir = filepath.ToSlash(previousDir)
 
 	fileToFindStr := DefaultTerragruntConfigPath
 	if fileToFindParam != "" {
@@ -333,13 +412,28 @@ func findInParentFolders(params []string, include *IncludeConfig, terragruntOpti
 }
 
 // Return the relative path between the included Terragrunt configuration file and the current Terragrunt configuration
-// file
-func pathRelativeToInclude(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
-	if include == nil {
+// file. Name param is required and used to lookup the relevant import block when called in a child config with multiple
+// import blocks.
+func pathRelativeToInclude(params []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	if trackInclude == nil {
 		return ".", nil
 	}
 
-	includePath := filepath.Dir(include.Path)
+	var included IncludeConfig
+	if trackInclude.Original != nil {
+		included = *trackInclude.Original
+	} else if len(trackInclude.CurrentList) > 0 {
+		// Called in child context, so we need to select the right include file.
+		selected, err := getSelectedIncludeBlock(*trackInclude, params)
+		if err != nil {
+			return "", err
+		}
+		included = *selected
+	} else {
+		return ".", nil
+	}
+
+	includePath := filepath.Dir(included.Path)
 	currentPath := filepath.Dir(terragruntOptions.TerragruntConfigPath)
 
 	if !filepath.IsAbs(includePath) {
@@ -350,12 +444,19 @@ func pathRelativeToInclude(include *IncludeConfig, terragruntOptions *options.Te
 }
 
 // Return the relative path from the current Terragrunt configuration to the included Terragrunt configuration file
-func pathRelativeFromInclude(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
-	if include == nil {
+func pathRelativeFromInclude(params []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
+	if trackInclude == nil {
 		return ".", nil
 	}
 
-	includePath := filepath.Dir(include.Path)
+	included, err := getSelectedIncludeBlock(*trackInclude, params)
+	if err != nil {
+		return "", err
+	} else if included == nil {
+		return ".", nil
+	}
+
+	includePath := filepath.Dir(included.Path)
 	currentPath := filepath.Dir(terragruntOptions.TerragruntConfigPath)
 
 	if !filepath.IsAbs(includePath) {
@@ -366,17 +467,17 @@ func pathRelativeFromInclude(include *IncludeConfig, terragruntOptions *options.
 }
 
 // getTerraformCommand returns the current terraform command in execution
-func getTerraformCommand(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getTerraformCommand(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	return terragruntOptions.TerraformCommand, nil
 }
 
 // getTerraformCliArgs returns cli args for terraform
-func getTerraformCliArgs(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) ([]string, error) {
+func getTerraformCliArgs(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) ([]string, error) {
 	return terragruntOptions.TerraformCliArgs, nil
 }
 
 // Return the AWS account id associated to the current set of credentials
-func getAWSAccountID(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getAWSAccountID(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	accountID, err := aws_helper.GetAWSAccountID(nil, terragruntOptions)
 	if err == nil {
 		return accountID, nil
@@ -385,7 +486,7 @@ func getAWSAccountID(include *IncludeConfig, terragruntOptions *options.Terragru
 }
 
 // Return the ARN of the AWS identity associated with the current set of credentials
-func getAWSCallerIdentityARN(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getAWSCallerIdentityARN(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	identityARN, err := aws_helper.GetAWSIdentityArn(nil, terragruntOptions)
 	if err == nil {
 		return identityARN, nil
@@ -394,7 +495,7 @@ func getAWSCallerIdentityARN(include *IncludeConfig, terragruntOptions *options.
 }
 
 // Return the UserID of the AWS identity associated with the current set of credentials
-func getAWSCallerIdentityUserID(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getAWSCallerIdentityUserID(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	userID, err := aws_helper.GetAWSUserID(nil, terragruntOptions)
 	if err == nil {
 		return userID, nil
@@ -418,7 +519,7 @@ func readTerragruntConfig(configPath string, defaultVal *cty.Value, terragruntOp
 
 	// We update the context of terragruntOptions to the config being read in.
 	targetOptions := terragruntOptions.Clone(targetConfig)
-	config, err := ParseConfigFile(targetConfig, targetOptions, nil)
+	config, err := ParseConfigFile(targetConfig, targetOptions, nil, nil)
 	if err != nil {
 		return cty.NilVal, err
 	}
@@ -431,7 +532,7 @@ func readTerragruntConfig(configPath string, defaultVal *cty.Value, terragruntOp
 		config.TerragruntDependencies[i].setRenderedOutputs(targetOptions)
 	}
 
-	return terragruntConfigAsCty(config)
+	return TerragruntConfigAsCty(config)
 }
 
 // Create a cty Function that can be used to for calling read_terragrunt_config.
@@ -542,17 +643,17 @@ func getModulePathFromSourceUrl(sourceUrl string) (string, error) {
 }
 
 //
-// A map that caches the results of a decrypt operation via sops. Each decryption
+// A cache of the results of a decrypt operation via sops. Each decryption
 // operation can take several seconds, so this cache speeds up terragrunt executions
 // where the same sops files are referenced multiple times.
 //
-// The keys are the canonical paths to the encrypted files, and the values are the
+// The cache keys are the canonical paths to the encrypted files, and the values are the
 // plain-text result of the decrypt operation.
 //
-var sopsCache = make(map[string]string)
+var sopsCache = NewStringCache()
 
 // decrypts and returns sops encrypted utf-8 yaml or json data as a string
-func sopsDecryptFile(params []string, include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func sopsDecryptFile(params []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	numParams := len(params)
 
 	var sourceFile string
@@ -563,23 +664,16 @@ func sopsDecryptFile(params []string, include *IncludeConfig, terragruntOptions 
 	if numParams != 1 {
 		return "", errors.WithStackTrace(WrongNumberOfParams{Func: "sops_decrypt_file", Expected: "1", Actual: numParams})
 	}
-
-	var format string
-	switch ext := path.Ext(sourceFile); ext {
-	case ".json":
-		format = "json"
-	case ".yaml", ".yml":
-		format = "yaml"
-	default:
-		return "", errors.WithStackTrace(InvalidSopsFormat{SourceFilePath: sourceFile})
+	format, err := getSopsFileFormat(sourceFile)
+	if err != nil {
+		return "", errors.WithStackTrace(err)
 	}
-
 	canonicalSourceFile, err := util.CanonicalPath(sourceFile, terragruntOptions.WorkingDir)
 	if err != nil {
 		return "", errors.WithStackTrace(err)
 	}
 
-	if val, ok := sopsCache[canonicalSourceFile]; ok {
+	if val, ok := sopsCache.Get(canonicalSourceFile); ok {
 		return val, nil
 	}
 
@@ -590,16 +684,101 @@ func sopsDecryptFile(params []string, include *IncludeConfig, terragruntOptions 
 
 	if utf8.Valid(rawData) {
 		value := string(rawData)
-		sopsCache[canonicalSourceFile] = value
+		sopsCache.Put(canonicalSourceFile, value)
 		return value, nil
 	}
 
 	return "", errors.WithStackTrace(InvalidSopsFormat{SourceFilePath: sourceFile})
 }
 
+// Mapping of SOPS format to string
+var sopsFormatToString = map[formats.Format]string{
+	formats.Binary: "binary",
+	formats.Dotenv: "dotenv",
+	formats.Ini:    "ini",
+	formats.Json:   "json",
+	formats.Yaml:   "yaml",
+}
+
+// getSopsFileFormat - Return file format for SOPS library
+func getSopsFileFormat(sourceFile string) (string, error) {
+	fileFormat := formats.FormatForPath(sourceFile)
+	format, found := sopsFormatToString[fileFormat]
+	if !found {
+		return "", InvalidSopsFormat{SourceFilePath: sourceFile}
+	}
+	return format, nil
+}
+
 // Return the location of the Terraform files provided via --terragrunt-source
-func getTerragruntSourceCliFlag(include *IncludeConfig, terragruntOptions *options.TerragruntOptions) (string, error) {
+func getTerragruntSourceCliFlag(trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (string, error) {
 	return terragruntOptions.Source, nil
+}
+
+// Return the selected include block based on a label passed in as a function param. Note that the assumption is that:
+// - If the Original attribute is set, we are in the parent context so return that.
+// - If there are no include blocks, no param is required and nil is returned.
+// - If there is only one include block, no param is required and that is automatically returned.
+// - If there is more than one include block, 1 param is required to use as the label name to lookup the include block
+//   to use.
+func getSelectedIncludeBlock(trackInclude TrackInclude, params []string) (*IncludeConfig, error) {
+	importMap := trackInclude.CurrentMap
+
+	if trackInclude.Original != nil {
+		return trackInclude.Original, nil
+	}
+
+	if len(importMap) == 0 {
+		return nil, nil
+	}
+
+	if len(importMap) == 1 {
+		for _, val := range importMap {
+			return &val, nil
+		}
+	}
+
+	numParams := len(params)
+	if numParams != 1 {
+		return nil, errors.WithStackTrace(WrongNumberOfParams{Func: "path_relative_from_include", Expected: "1", Actual: numParams})
+	}
+
+	importName := params[0]
+	imported, hasKey := importMap[importName]
+	if !hasKey {
+		return nil, errors.WithStackTrace(InvalidIncludeKey{name: importName})
+	}
+	return &imported, nil
+}
+
+// startsWith Implementation of Terraform's startsWith function
+func startsWith(args []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (bool, error) {
+	if len(args) == 0 {
+		return false, errors.WithStackTrace(EmptyStringNotAllowed("parameter to the startswith function"))
+	}
+	str := args[0]
+	prefix := args[1]
+
+	if strings.HasPrefix(str, prefix) {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// endsWith Implementation of Terraform's endsWith function
+func endsWith(args []string, trackInclude *TrackInclude, terragruntOptions *options.TerragruntOptions) (bool, error) {
+	if len(args) == 0 {
+		return false, errors.WithStackTrace(EmptyStringNotAllowed("parameter to the endswith function"))
+	}
+	str := args[0]
+	suffix := args[1]
+
+	if strings.HasSuffix(str, suffix) {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // Custom error types
@@ -704,4 +883,12 @@ type InvalidSopsFormat struct {
 
 func (err InvalidSopsFormat) Error() string {
 	return fmt.Sprintf("File %s is not a valid format or encoding. Terragrunt will only decrypt yaml or json files in UTF-8 encoding.", err.SourceFilePath)
+}
+
+type InvalidIncludeKey struct {
+	name string
+}
+
+func (err InvalidIncludeKey) Error() string {
+	return fmt.Sprintf("There is no include block in the current config with the label '%s'", err.name)
 }

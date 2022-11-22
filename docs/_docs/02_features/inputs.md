@@ -5,7 +5,7 @@ category: features
 categories_url: features
 excerpt: Learn how to use inputs.
 tags: ["inputs"]
-order: 205
+order: 230
 nav_title: Documentation
 nav_title_link: /docs/
 ---
@@ -35,7 +35,7 @@ Whenever you run a Terragrunt command, Terragrunt will set any inputs you pass i
     TF_VAR_tags='{"Name":"example-app"}' \
     terraform apply
 
-Note that Terragrunt will respect any `TF_VAR_xxx` variables you’ve manually set in your environment, ensuring that anything in `inputs` will NOT be override anything you’ve already set in your environment.
+Note that Terragrunt will respect any `TF_VAR_xxx` variables you’ve manually set in your environment, ensuring that anything in `inputs` will NOT override anything you’ve already set in your environment.
 
 ### Variable precedence
 
@@ -51,6 +51,6 @@ Variables are loaded in the following order:
 
   - `terraform.tfvars.json` file, if present.
 
-  - Any `.auto.tfvars`/`</emphasis>.auto.tfvars.json` files, processed in order of their filenames.
+  - Any `*.auto.tfvars`/`*.auto.tfvars.json` files, processed in order of their filenames.
 
   - Any `-var`/`-var-file` options on the command line, in the order they are provided.
